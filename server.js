@@ -41,9 +41,12 @@ app.get('/api/tracking', async (req, res) => {
                     let tracking_code = '';
 
                     if (records.length > 0) {
-                        const latest = records.reduce((a, b) => (a.actual_time > b.actual_time ? a : b));
-                        tracking_code = latest.tracking_code
-                        description = latest.buyer_description || latest.milestone_name || 'Không rõ trạng thái';
+                        const firstRecord = records[0]; // Lấy bản ghi đầu tiên
+                        tracking_code = firstRecord.tracking_code;
+                        description = firstRecord.buyer_description || firstRecord.milestone_name || 'Không rõ trạng thái';
+                        // const latest = records.reduce((a, b) => (a.actual_time > b.actual_time ? a : b));
+                        // tracking_code = latest.tracking_code
+                        // description = latest.buyer_description || latest.milestone_name || 'Không rõ trạng thái';
                     }
 
                     return {
@@ -73,6 +76,28 @@ app.get('/api/tracking', async (req, res) => {
         return res.status(500).json({ error: 'Internal server error' });
     }
 });
+// ✅ API nhận và gửi thông báo Discord
+app.post('/api/notify', async (req, res) => {
+    const { trackingNumber, note, message, status } = req.body;
+
+    if (!trackingNumber || !message || !status) {
+        return res.status(400).json({ error: 'Thiếu thông tin gửi thông báo' });
+    }
+
+    const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1376784789494825071/7gALtt8tAXqI5O6EBsK_jIiXctZ5CZmb2E3Nc_zo8uV8zJxF9q9XlIIikJhNaLKs4zt9"'; // 🔁 Thay bằng webhook thật
+
+    const content = `📦 Đơn hàng **${trackingNumber}** ${note || ''} ${message}.\n➡️ Trạng thái: *${status}*`;
+
+    try {
+        await axios.post(DISCORD_WEBHOOK_URL, { content });
+        res.json({ success: true });
+    } catch (error) {
+        console.error("Lỗi gửi Discord:", error.message);
+        res.status(500).json({ error: "Lỗi khi gửi tới Discord" });
+    }
+});
+
+
 app.get('/', (req, res) => {
     res.json({ "status": "ok" })
 })
