@@ -92,17 +92,33 @@ app.post('/api/ghn-tracking', async (req, res) => {
         'https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs';
 
     try {
-        const results = await Promise.all(
-            orderCodes.map(async (rawOrderCode) => {
-                const orderCode = String(rawOrderCode || '').trim().toUpperCase();
+        const results = [];
+        const sleep = (milliseconds) =>
+            new Promise(resolve => setTimeout(resolve, milliseconds));
 
-                if (!/^[A-Z0-9]{8,12}$/.test(orderCode)) {
-                    return {
-                        order_code: orderCode,
-                        status_name: 'Mã GHN không hợp lệ'
-                    };
-                }
+        // Gọi tuần tự để tránh GHN rate-limit khi nhiều mã được gửi cùng lúc.
+        for (let orderIndex = 0; orderIndex < orderCodes.length; orderIndex++) {
+            // GHN hiện giới hạn khoảng 5 request trong một cửa sổ ngắn.
+            // Nghỉ giữa mỗi nhóm 5 mã để tránh mã thứ 6 trở đi bị HTTP 429.
+            if (orderIndex > 0 && orderIndex % 5 === 0) {
+                await sleep(12000);
+            }
 
+            const rawOrderCode = orderCodes[orderIndex];
+            const orderCode = String(rawOrderCode || '').trim().toUpperCase();
+
+            if (!/^[A-Z0-9]{8,12}$/.test(orderCode)) {
+                results.push({
+                    order_code: orderCode,
+                    status_name: 'Mã GHN không hợp lệ'
+                });
+                continue;
+            }
+
+            let trackingResult = null;
+            const maxRetries = 5;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
                     const response = await axios.post(
                         ghnTrackingUrl,
@@ -131,7 +147,7 @@ app.post('/api/ghn-tracking', async (req, res) => {
                         ? trackingLogs[trackingLogs.length - 1]
                         : {};
 
-                    return {
+                    trackingResult = {
                         order_code: orderCode,
                         status: orderInfo.status || latestLog.status || '',
                         status_name:
@@ -141,23 +157,54 @@ app.post('/api/ghn-tracking', async (req, res) => {
                             latestLog.status ||
                             'Không có dữ liệu'
                     };
+                    break;
                 } catch (error) {
                     const responseStatus = error.response?.status;
+                    const shouldRetry =
+                        responseStatus === 429 && attempt < maxRetries;
+
+                    if (shouldRetry) {
+                        const retryAfterHeader =
+                            error.response?.headers?.['retry-after'];
+                        const retryAfterMilliseconds =
+                            Number(retryAfterHeader) > 0
+                                ? Number(retryAfterHeader) * 1000
+                                : 1000 * Math.pow(2, attempt - 1);
+
+                        console.warn(
+                            `GHN ${orderCode}: HTTP 429, retry ${attempt}/${maxRetries} ` +
+                            `after ${retryAfterMilliseconds}ms`
+                        );
+                        await sleep(retryAfterMilliseconds);
+                        continue;
+                    }
+
                     console.error(
                         `GHN ${orderCode}:`,
                         responseStatus || error.message
                     );
-
-                    return {
+                    trackingResult = {
                         order_code: orderCode,
                         status_name: 'Không có dữ liệu',
                         error: responseStatus
                             ? `GHN HTTP ${responseStatus}`
                             : error.message
                     };
+                    break;
                 }
-            })
-        );
+            }
+
+            results.push(
+                trackingResult || {
+                    order_code: orderCode,
+                    status_name: 'Không có dữ liệu',
+                    error: 'GHN did not return a result'
+                }
+            );
+
+            // Khoảng nghỉ nhỏ giữa hai mã để tránh tạo burst request.
+            await sleep(500);
+        }
 
         return res.json({
             results,
