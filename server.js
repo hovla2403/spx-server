@@ -95,15 +95,34 @@ app.post('/api/ghn-tracking', async (req, res) => {
         const results = [];
         const sleep = (milliseconds) =>
             new Promise(resolve => setTimeout(resolve, milliseconds));
+        const rateLimit = {
+            limit: null,
+            remaining: null,
+            reset: null
+        };
+        const updateRateLimit = (headers = {}) => {
+            const limit = Number(headers['x-ratelimit-limit']);
+            const remaining = Number(headers['x-ratelimit-remaining']);
+            const reset = Number(headers['x-ratelimit-reset']);
 
-        // Gọi tuần tự để tránh GHN rate-limit khi nhiều mã được gửi cùng lúc.
-        for (let orderIndex = 0; orderIndex < orderCodes.length; orderIndex++) {
-            // GHN hiện giới hạn khoảng 5 request trong một cửa sổ ngắn.
-            // Nghỉ giữa mỗi nhóm 5 mã để tránh mã thứ 6 trở đi bị HTTP 429.
-            if (orderIndex > 0 && orderIndex % 5 === 0) {
-                await sleep(12000);
+            if (Number.isFinite(limit)) rateLimit.limit = limit;
+            if (Number.isFinite(remaining)) rateLimit.remaining = remaining;
+            if (Number.isFinite(reset)) rateLimit.reset = reset;
+        };
+        const millisecondsUntilReset = (headers = {}) => {
+            updateRateLimit(headers);
+            const resetAt = Number(headers['x-ratelimit-reset'] || rateLimit.reset);
+
+            if (Number.isFinite(resetAt) && resetAt > 0) {
+                return Math.max(1000, resetAt * 1000 - Date.now() + 1000);
             }
 
+            return 3000;
+        };
+
+        // GHN cho phép burst tối đa 5 request trong cửa sổ 15 giây.
+        // Đọc header remaining/reset để chỉ nghỉ đúng thời gian cần thiết.
+        for (let orderIndex = 0; orderIndex < orderCodes.length; orderIndex++) {
             const rawOrderCode = orderCodes[orderIndex];
             const orderCode = String(rawOrderCode || '').trim().toUpperCase();
 
@@ -138,6 +157,7 @@ app.post('/api/ghn-tracking', async (req, res) => {
                         }
                     );
 
+                    updateRateLimit(response.headers);
                     const data = response.data?.data || {};
                     const orderInfo = data.order_info || {};
                     const trackingLogs = Array.isArray(data.tracking_logs)
@@ -169,7 +189,9 @@ app.post('/api/ghn-tracking', async (req, res) => {
                         const retryAfterMilliseconds =
                             Number(retryAfterHeader) > 0
                                 ? Number(retryAfterHeader) * 1000
-                                : 1000 * Math.pow(2, attempt - 1);
+                                : millisecondsUntilReset(
+                                    error.response?.headers || {}
+                                );
 
                         console.warn(
                             `GHN ${orderCode}: HTTP 429, retry ${attempt}/${maxRetries} ` +
@@ -202,13 +224,22 @@ app.post('/api/ghn-tracking', async (req, res) => {
                 }
             );
 
-            // Khoảng nghỉ nhỏ giữa hai mã để tránh tạo burst request.
-            await sleep(500);
+            if (
+                orderIndex < orderCodes.length - 1 &&
+                rateLimit.remaining === 0
+            ) {
+                const waitMilliseconds = millisecondsUntilReset();
+                console.log(
+                    `GHN rate limit exhausted; wait ${waitMilliseconds}ms`
+                );
+                await sleep(waitMilliseconds);
+            }
         }
 
         return res.json({
             results,
-            total: results.length
+            total: results.length,
+            rate_limit: rateLimit
         });
     } catch (error) {
         console.error('Unexpected GHN proxy error:', error.message);
