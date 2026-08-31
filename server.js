@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -78,15 +79,48 @@ app.get('/api/tracking', async (req, res) => {
 });
 // Proxy GHN vì GHN chặn User-Agent mặc định của Google Apps Script.
 app.post('/api/ghn-tracking', async (req, res) => {
-    const orderCodes = Array.isArray(req.body?.order_codes)
-        ? req.body.order_codes
-        : [];
+    const rawOrders = Array.isArray(req.body?.orders)
+        ? req.body.orders
+        : Array.isArray(req.body?.order_codes)
+            ? req.body.order_codes.map((orderCode, index) => ({
+                order_code: orderCode,
+                to_phone: Array.isArray(req.body?.phones)
+                    ? req.body.phones[index]
+                    : ''
+            }))
+            : [];
 
-    if (orderCodes.length === 0 || orderCodes.length > 25) {
+    if (rawOrders.length === 0 || rawOrders.length > 25) {
         return res.status(400).json({
-            error: 'order_codes must contain between 1 and 25 tracking numbers'
+            error: 'orders must contain between 1 and 25 tracking numbers'
         });
     }
+
+    const normalizePhone = rawPhone => {
+        let phone = String(rawPhone || '').replace(/\D/g, '');
+
+        if (phone.length === 11 && phone.startsWith('84')) {
+            phone = `0${phone.slice(2)}`;
+        } else if (phone.length === 9) {
+            phone = `0${phone}`;
+        }
+
+        return /^0\d{9}$/.test(phone) ? phone : '';
+    };
+
+    const orders = rawOrders.map(item => {
+        if (item && typeof item === 'object') {
+            return {
+                orderCode: String(item.order_code || '').trim().toUpperCase(),
+                phone: normalizePhone(item.to_phone || item.phone)
+            };
+        }
+
+        return {
+            orderCode: String(item || '').trim().toUpperCase(),
+            phone: ''
+        };
+    });
 
     const ghnTrackingUrl =
         'https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs';
@@ -122,9 +156,8 @@ app.post('/api/ghn-tracking', async (req, res) => {
 
         // GHN cho phép burst tối đa 5 request trong cửa sổ 15 giây.
         // Đọc header remaining/reset để chỉ nghỉ đúng thời gian cần thiết.
-        for (let orderIndex = 0; orderIndex < orderCodes.length; orderIndex++) {
-            const rawOrderCode = orderCodes[orderIndex];
-            const orderCode = String(rawOrderCode || '').trim().toUpperCase();
+        for (let orderIndex = 0; orderIndex < orders.length; orderIndex++) {
+            const { orderCode, phone } = orders[orderIndex];
 
             if (!/^[A-Z0-9]{8,12}$/.test(orderCode)) {
                 results.push({
@@ -139,9 +172,20 @@ app.post('/api/ghn-tracking', async (req, res) => {
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
+                    // GHN tạo token theo đúng công thức dùng trên trang donhang.ghn.vn.
+                    const phoneVerify = phone
+                        ? crypto
+                            .createHash('sha256')
+                            .update(`${orderCode}|${phone}`)
+                            .digest('hex')
+                        : '';
+                    const requestBody = { order_code: orderCode };
+
+                    if (phoneVerify) requestBody.phone_verify = phoneVerify;
+
                     const response = await axios.post(
                         ghnTrackingUrl,
-                        { order_code: orderCode },
+                        requestBody,
                         {
                             timeout: 10000,
                             headers: {
@@ -169,6 +213,7 @@ app.post('/api/ghn-tracking', async (req, res) => {
 
                     trackingResult = {
                         order_code: orderCode,
+                        phone_verified: Boolean(phoneVerify),
                         status: orderInfo.status || latestLog.status || '',
                         status_name:
                             orderInfo.status_name ||
@@ -180,6 +225,7 @@ app.post('/api/ghn-tracking', async (req, res) => {
                     break;
                 } catch (error) {
                     const responseStatus = error.response?.status;
+                    const responseCode = error.response?.data?.code_message;
                     const shouldRetry =
                         responseStatus === 429 && attempt < maxRetries;
 
@@ -207,9 +253,12 @@ app.post('/api/ghn-tracking', async (req, res) => {
                     );
                     trackingResult = {
                         order_code: orderCode,
-                        status_name: 'Không có dữ liệu',
+                        phone_verified: Boolean(phone),
+                        status_name: responseCode === 'PHONE_VERIFY_REQUIRED'
+                            ? 'Cần số điện thoại người nhận'
+                            : 'Không có dữ liệu',
                         error: responseStatus
-                            ? `GHN HTTP ${responseStatus}`
+                            ? `GHN HTTP ${responseStatus}${responseCode ? `: ${responseCode}` : ''}`
                             : error.message
                     };
                     break;
@@ -225,7 +274,7 @@ app.post('/api/ghn-tracking', async (req, res) => {
             );
 
             if (
-                orderIndex < orderCodes.length - 1 &&
+                orderIndex < orders.length - 1 &&
                 rateLimit.remaining === 0
             ) {
                 const waitMilliseconds = millisecondsUntilReset();
